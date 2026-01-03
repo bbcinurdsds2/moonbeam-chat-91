@@ -10,12 +10,21 @@ export interface Message {
 
 const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
 
-export const useChat = (sessionId?: string) => {
+export const useChat = (accessToken?: string) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim() || isLoading) return;
+
+    if (!accessToken) {
+      toast({
+        title: "Not authenticated",
+        description: "Please log in to send messages",
+        variant: "destructive",
+      });
+      return;
+    }
 
     const userMessage: Message = {
       id: crypto.randomUUID(),
@@ -60,9 +69,9 @@ export const useChat = (sessionId?: string) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          Authorization: `Bearer ${accessToken}`,
         },
-        body: JSON.stringify({ messages: messagesForAPI, sessionId }),
+        body: JSON.stringify({ messages: messagesForAPI }),
       });
 
       if (!response.ok || !response.body) {
@@ -120,7 +129,7 @@ export const useChat = (sessionId?: string) => {
     } finally {
       setIsLoading(false);
     }
-  }, [messages, isLoading, sessionId]);
+  }, [messages, isLoading, accessToken]);
 
   const clearMessages = useCallback(() => {
     setMessages([]);

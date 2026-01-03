@@ -1,13 +1,18 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatArea } from "@/components/ChatArea";
 import { ChatInput } from "@/components/ChatInput";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { useChat } from "@/hooks/useChat";
 import { useGoogleServices, GoogleService } from "@/hooks/useGoogleServices";
+import { useAuth } from "@/hooks/useAuth";
 import { toast } from "@/hooks/use-toast";
+import { Loader2 } from "lucide-react";
 
 const Index = () => {
+  const navigate = useNavigate();
+  const { isAuthenticated, isLoading: authLoading, session } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { 
@@ -17,10 +22,15 @@ const Index = () => {
     gmailEmail,
     calendarEmail,
     driveEmail,
-    connect, 
-    sessionId 
+    connect,
   } = useGoogleServices();
-  const { messages, isLoading, sendMessage, clearMessages } = useChat(sessionId);
+  const { messages, isLoading, sendMessage, clearMessages } = useChat(session?.access_token);
+
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      navigate('/auth', { replace: true });
+    }
+  }, [authLoading, isAuthenticated, navigate]);
 
   const handleConnectService = async (service: GoogleService) => {
     const isConnected = service === 'gmail' ? isGmailConnected 
@@ -54,6 +64,18 @@ const Index = () => {
       }
     }
   };
+
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-background">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return null;
+  }
 
   return (
     <div className="flex h-screen bg-background">
