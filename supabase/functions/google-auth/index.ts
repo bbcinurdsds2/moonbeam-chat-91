@@ -3,8 +3,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
-  'https://prkwawpjybifpybkqavf.lovable.app',
-  'https://prkwawpjybifpybkqavf.supabase.co',
+  'https://bgmbwlasqwddqonadbvb.lovable.app',
+  'https://bgmbwlasqwddqonadbvb.supabase.co',
   Deno.env.get('ALLOWED_ORIGIN'),
 ].filter(Boolean) as string[];
 

@@ -4,8 +4,8 @@ import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
-  'https://prkwawpjybifpybkqavf.lovable.app',
-  'https://prkwawpjybifpybkqavf.supabase.co',
+  'https://bgmbwlasqwddqonadbvb.lovable.app',
+  'https://bgmbwlasqwddqonadbvb.supabase.co',
   Deno.env.get('ALLOWED_ORIGIN'),
 ].filter(Boolean) as string[];
 
