@@ -325,75 +325,187 @@ interface CreateEventParams {
   allDay?: boolean;
 }
 
+function parseFlexibleDate(text: string): { start: string; end: string; allDay: boolean } | null {
+  const now = new Date();
+  const content = text.toLowerCase();
+  
+  // Month name mapping
+  const months: Record<string, number> = {
+    'january': 0, 'jan': 0, 'february': 1, 'feb': 1, 'march': 2, 'mar': 2,
+    'april': 3, 'apr': 3, 'may': 4, 'june': 5, 'jun': 5, 'july': 6, 'jul': 6,
+    'august': 7, 'aug': 7, 'september': 8, 'sep': 8, 'sept': 8, 'october': 9, 'oct': 9,
+    'november': 10, 'nov': 10, 'december': 11, 'dec': 11
+  };
+  
+  let targetDate: Date | null = null;
+  let allDay = true;
+  
+  // Check for "today"
+  if (content.includes('today')) {
+    targetDate = new Date(now);
+  }
+  // Check for "tomorrow"
+  else if (content.includes('tomorrow')) {
+    targetDate = new Date(now);
+    targetDate.setDate(targetDate.getDate() + 1);
+  }
+  // Check for "next week"
+  else if (content.includes('next week')) {
+    targetDate = new Date(now);
+    targetDate.setDate(targetDate.getDate() + 7);
+  }
+  // Check for specific date patterns: "May 2026", "May 15 2026", "May 15, 2026", "15 May 2026"
+  else {
+    // Pattern: "Month Year" (e.g., "May 2026") - use first day of month
+    const monthYearMatch = content.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b/i);
+    if (monthYearMatch) {
+      const month = months[monthYearMatch[1].toLowerCase()];
+      const year = parseInt(monthYearMatch[2]);
+      targetDate = new Date(year, month, 1);
+    }
+    
+    // Pattern: "Month Day Year" (e.g., "May 15 2026" or "May 15, 2026")
+    const monthDayYearMatch = content.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/i);
+    if (monthDayYearMatch) {
+      const month = months[monthDayYearMatch[1].toLowerCase()];
+      const day = parseInt(monthDayYearMatch[2]);
+      const year = parseInt(monthDayYearMatch[3]);
+      targetDate = new Date(year, month, day);
+    }
+    
+    // Pattern: "Day Month Year" (e.g., "15 May 2026" or "15th May 2026")
+    const dayMonthYearMatch = content.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b/i);
+    if (dayMonthYearMatch && !targetDate) {
+      const day = parseInt(dayMonthYearMatch[1]);
+      const month = months[dayMonthYearMatch[2].toLowerCase()];
+      const year = parseInt(dayMonthYearMatch[3]);
+      targetDate = new Date(year, month, day);
+    }
+    
+    // Pattern: YYYY-MM-DD or MM/DD/YYYY
+    const isoMatch = content.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+    if (isoMatch) {
+      targetDate = new Date(parseInt(isoMatch[1]), parseInt(isoMatch[2]) - 1, parseInt(isoMatch[3]));
+    }
+    
+    const usDateMatch = content.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+    if (usDateMatch && !targetDate) {
+      targetDate = new Date(parseInt(usDateMatch[3]), parseInt(usDateMatch[1]) - 1, parseInt(usDateMatch[2]));
+    }
+  }
+  
+  if (!targetDate || isNaN(targetDate.getTime())) {
+    return null;
+  }
+  
+  // Check for specific time
+  const timeMatch = content.match(/(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  if (timeMatch) {
+    let hour = parseInt(timeMatch[1]);
+    const minute = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+    const ampm = timeMatch[3]?.toLowerCase();
+    
+    if (ampm === 'pm' && hour < 12) hour += 12;
+    if (ampm === 'am' && hour === 12) hour = 0;
+    
+    // Only use time if it looks like a valid time (not a day number)
+    if (hour >= 0 && hour <= 23 && (ampm || hour > 12)) {
+      targetDate.setHours(hour, minute, 0, 0);
+      allDay = false;
+    }
+  }
+  
+  const start = allDay 
+    ? targetDate.toISOString().split('T')[0]
+    : targetDate.toISOString();
+    
+  const endDate = new Date(targetDate);
+  if (allDay) {
+    endDate.setDate(endDate.getDate() + 1);
+  } else {
+    endDate.setHours(endDate.getHours() + 1);
+  }
+  
+  const end = allDay
+    ? endDate.toISOString().split('T')[0]
+    : endDate.toISOString();
+  
+  return { start, end, allDay };
+}
+
 function extractCreateEventIntent(messages: any[]): CreateEventParams | null {
   const recentMessages = messages.slice(-6);
   
   for (const msg of recentMessages) {
     if (msg.role !== 'user') continue;
     const content = msg.content.toLowerCase();
+    const fullContent = msg.content;
     
-    // Check for create/add/schedule event intent
-    if (
-      (content.includes('create') || content.includes('add') || content.includes('schedule') || content.includes('make')) &&
-      (content.includes('event') || content.includes('meeting') || content.includes('appointment') || content.includes('reminder'))
-    ) {
-      // Try to extract event details
-      const fullContent = msg.content;
-      
-      // Extract title/summary
+    // Check for create/add/schedule event intent - broader matching
+    const hasCreateIntent = 
+      (content.includes('create') || content.includes('add') || content.includes('schedule') || 
+       content.includes('make') || content.includes('set') || content.includes('put') || 
+       content.includes('new event') || content.includes('remind me')) &&
+      (content.includes('event') || content.includes('meeting') || content.includes('appointment') || 
+       content.includes('reminder') || content.includes('calendar') ||
+       // Also match if there's a date mentioned without explicit event keyword
+       /\b(january|february|march|april|may|june|july|august|september|october|november|december|today|tomorrow)\b/i.test(content));
+    
+    if (hasCreateIntent) {
+      // Extract title/summary - try various patterns
       let summary = '';
-      const titleMatch = fullContent.match(/(?:called|titled|named|for|about)[:\s]+["']?([^"'\n,]+)["']?/i) ||
-                        fullContent.match(/(?:event|meeting|appointment|reminder)[:\s]+["']?([^"'\n,]+)["']?/i);
+      
+      // Try explicit title patterns
+      const titleMatch = fullContent.match(/(?:called|titled|named|for|about|event)\s*[:\-]?\s*["']?([^"'\n,]+?)["']?\s*(?:on|at|in|for|$)/i);
       if (titleMatch) {
         summary = titleMatch[1].trim();
       }
       
-      // Extract date/time - look for various patterns
-      let start = '';
-      let end = '';
-      let allDay = false;
-      
-      // Check for "today", "tomorrow", specific dates
-      const now = new Date();
-      
-      if (content.includes('today')) {
-        const todayDate = now.toISOString().split('T')[0];
-        start = `${todayDate}T09:00:00Z`;
-        end = `${todayDate}T10:00:00Z`;
-      } else if (content.includes('tomorrow')) {
-        const tomorrow = new Date(now);
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        const tomorrowDate = tomorrow.toISOString().split('T')[0];
-        start = `${tomorrowDate}T09:00:00Z`;
-        end = `${tomorrowDate}T10:00:00Z`;
+      // If no explicit title, try to extract the action/thing
+      if (!summary) {
+        // Look for "create event, [action]" pattern
+        const actionMatch = fullContent.match(/(?:event|reminder|meeting)[,:]?\s+(.+?)(?:on|at|in|,|\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|today|tomorrow))/i);
+        if (actionMatch) {
+          summary = actionMatch[1].trim();
+        }
       }
       
-      // Look for specific time patterns
-      const timeMatch = content.match(/at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
-      if (timeMatch && start) {
-        let hour = parseInt(timeMatch[1]);
-        const minute = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
-        const ampm = timeMatch[3]?.toLowerCase();
-        
-        if (ampm === 'pm' && hour < 12) hour += 12;
-        if (ampm === 'am' && hour === 12) hour = 0;
-        
-        const datePrefix = start.split('T')[0];
-        start = `${datePrefix}T${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}:00Z`;
-        // Default duration 1 hour
-        const endHour = hour + 1;
-        end = `${datePrefix}T${endHour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}:00Z`;
+      // If still no summary, take everything before the date as the summary
+      if (!summary) {
+        const beforeDateMatch = fullContent.match(/(.+?)\s*(?:on|at|in|for)?\s*(?:january|february|march|april|may|june|july|august|september|october|november|december|today|tomorrow|\d{4})/i);
+        if (beforeDateMatch) {
+          summary = beforeDateMatch[1]
+            .replace(/^(?:create|add|schedule|make|set|put|new)\s*(?:an?)?\s*(?:event|meeting|appointment|reminder)?\s*[,:]?\s*/i, '')
+            .trim();
+        }
       }
+      
+      // Clean up summary
+      if (summary) {
+        summary = summary.replace(/[,.]$/, '').trim();
+        // Capitalize first letter
+        summary = summary.charAt(0).toUpperCase() + summary.slice(1);
+      }
+      
+      // Parse the date
+      const dateInfo = parseFlexibleDate(content);
       
       // Extract location
       let location = '';
-      const locationMatch = fullContent.match(/(?:at|in|location)[:\s]+["']?([^"'\n,]+)["']?(?:at|on|from)?/i);
+      const locationMatch = fullContent.match(/(?:at|in|location)[:\s]+["']?([^"'\n,]+?)["']?\s*(?:on|at\s+\d|$)/i);
       if (locationMatch && !locationMatch[1].match(/\d{1,2}(?::\d{2})?\s*(am|pm)?/i)) {
         location = locationMatch[1].trim();
       }
       
-      if (summary && start && end) {
-        return { summary, start, end, location: location || undefined, allDay };
+      if (summary && dateInfo) {
+        console.log("Extracted event intent:", { summary, ...dateInfo, location });
+        return { 
+          summary, 
+          start: dateInfo.start, 
+          end: dateInfo.end, 
+          allDay: dateInfo.allDay,
+          location: location || undefined 
+        };
       }
     }
   }
@@ -402,25 +514,24 @@ function extractCreateEventIntent(messages: any[]): CreateEventParams | null {
   const lastUserMsg = recentMessages.filter(m => m.role === 'user').pop();
   if (lastUserMsg) {
     const content = lastUserMsg.content.toLowerCase().trim();
-    if (content.match(/^(yes|create it|go ahead|confirm|do it|ok|okay|sure|please)\s*$/i)) {
+    if (content.match(/^(yes|create it|go ahead|confirm|do it|ok|okay|sure|please|yep|yeah)\s*[.!]?$/i)) {
       // Look for draft in previous assistant message
       const prevAssistant = recentMessages.filter(m => m.role === 'assistant').pop();
-      if (prevAssistant && prevAssistant.content.includes('📅')) {
+      if (prevAssistant && (prevAssistant.content.includes('📅') || prevAssistant.content.toLowerCase().includes('event'))) {
         const draftContent = prevAssistant.content;
         
-        const summaryMatch = draftContent.match(/\*\*(.+?)\*\*/);
-        const dateMatch = draftContent.match(/(\d{4}-\d{2}-\d{2})/);
-        const timeMatch = draftContent.match(/(\d{1,2}:\d{2})/);
+        // Try to extract event details from the draft
+        const summaryMatch = draftContent.match(/\*\*(.+?)\*\*/) || 
+                            draftContent.match(/(?:Title|Event)[:\s]+(.+?)(?:\n|$)/i);
         
-        if (summaryMatch && dateMatch) {
-          const summary = summaryMatch[1];
-          const date = dateMatch[1];
-          const time = timeMatch ? timeMatch[1] : '09:00';
-          const start = `${date}T${time}:00Z`;
-          const endTime = timeMatch ? `${parseInt(time.split(':')[0]) + 1}:${time.split(':')[1]}` : '10:00';
-          const end = `${date}T${endTime}:00Z`;
-          
-          return { summary, start, end };
+        let summary = summaryMatch ? summaryMatch[1].trim() : '';
+        
+        // Parse date from draft content
+        const dateInfo = parseFlexibleDate(draftContent.toLowerCase());
+        
+        if (summary && dateInfo) {
+          console.log("Extracted event from draft confirmation:", { summary, ...dateInfo });
+          return { summary, start: dateInfo.start, end: dateInfo.end, allDay: dateInfo.allDay };
         }
       }
     }
