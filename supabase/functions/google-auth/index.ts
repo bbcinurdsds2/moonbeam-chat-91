@@ -3,8 +3,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
-  'https://bgmbwlasqwddqonadbvb.lovable.app',
-  'https://bgmbwlasqwddqonadbvb.supabase.co',
+  'https://prkwawpjybifpybkqavf.lovable.app',
+  'https://prkwawpjybifpybkqavf.supabase.co',
   Deno.env.get('ALLOWED_ORIGIN'),
 ].filter(Boolean) as string[];
 
@@ -136,9 +136,7 @@ serve(async (req) => {
         });
       }
 
-      // Use origin from request header or fallback to Supabase auth callback
-      const origin = req.headers.get('origin') || `${SUPABASE_URL}/auth/v1/callback`;
-      const redirectUri = `${origin}/`;
+      const redirectUri = `${url.origin.replace('/functions/v1/google-auth', '')}/`;
       
       // Include service and user ID in state for security
       const state = btoa(JSON.stringify({ 
