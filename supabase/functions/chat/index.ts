@@ -540,6 +540,30 @@ function extractCreateEventIntent(messages: any[]): CreateEventParams | null {
   return null;
 }
 
+// Track processed actions to prevent duplicates
+const processedActions = new Map<string, boolean>();
+
+function getActionKey(type: string, identifier: string): string {
+  return `${type}:${identifier}`;
+}
+
+function hasProcessedAction(messages: any[], type: string, identifier: string): boolean {
+  // Check if this action was already processed in a previous assistant message
+  const key = `${type}:${identifier}`.toLowerCase();
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && msg.content) {
+      const content = msg.content.toLowerCase();
+      if (type === 'calendar' && content.includes('event created') && content.includes(identifier.toLowerCase())) {
+        return true;
+      }
+      if (type === 'email' && content.includes('email sent') && content.includes(identifier.toLowerCase())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -572,20 +596,25 @@ serve(async (req) => {
       if (gmailToken) {
         connectedGmail = gmailToken.email;
         
-        // Check for send email intent
+        // Check for send email intent - but only if not already processed
         const sendIntent = extractSendEmailIntent(messages);
         if (sendIntent) {
-          console.log("Send email intent detected:", sendIntent);
-          const result = await sendEmail(gmailToken.token, sendIntent);
-          if (result.success) {
-            actionResult += `\n\n✅ EMAIL SENT SUCCESSFULLY!\nTo: ${sendIntent.to}\nSubject: ${sendIntent.subject}\n\nThe email has been sent from your Gmail account (${connectedGmail}).`;
+          const actionKey = `${sendIntent.to}:${sendIntent.subject}`;
+          if (!hasProcessedAction(messages, 'email', actionKey)) {
+            console.log("Send email intent detected:", sendIntent);
+            const result = await sendEmail(gmailToken.token, sendIntent);
+            if (result.success) {
+              actionResult += `\n\n✅ EMAIL SENT SUCCESSFULLY!\nTo: ${sendIntent.to}\nSubject: ${sendIntent.subject}\n\nThe email has been sent from your Gmail account (${connectedGmail}).`;
+            } else {
+              actionResult += `\n\n❌ Failed to send email: ${result.message}`;
+            }
           } else {
-            actionResult += `\n\n❌ Failed to send email: ${result.message}`;
+            console.log("Email already sent, skipping duplicate");
           }
         }
         
         // Check if we should fetch emails
-        if (shouldFetchEmails(messages)) {
+        if (shouldFetchEmails(messages) && !sendIntent) {
           console.log("Email-related query detected, fetching emails...");
           const emails = await fetchEmails(gmailToken.token, undefined, 10);
           
@@ -601,10 +630,6 @@ serve(async (req) => {
               });
               emailContext += `| ${index + 1} | ${fromName} | ${subjectShort} | ${dateShort} |\n`;
             });
-            emailContext += `\n**Summary of Key Emails:**\n`;
-            emails.slice(0, 5).forEach((email: any, index: number) => {
-              emailContext += `${index + 1}. **${email.from.replace(/<[^>]+>/g, '').trim()}** - ${email.snippet}\n`;
-            });
           }
         }
       } else if (shouldFetchEmails(messages)) {
@@ -617,18 +642,23 @@ serve(async (req) => {
       if (calendarToken) {
         connectedCalendar = calendarToken.email;
         
-        // Check for create event intent
+        // Check for create event intent - but only if not already processed
         const createIntent = extractCreateEventIntent(messages);
         if (createIntent) {
-          console.log("Create event intent detected:", createIntent);
-          const result = await createEvent(calendarToken.token, createIntent);
-          if (result.success && result.event) {
-            actionResult += `\n\n✅ EVENT CREATED SUCCESSFULLY!\n📅 **${result.event.summary}**\n🕐 ${new Date(result.event.start).toLocaleString()} - ${new Date(result.event.end).toLocaleString()}\n🔗 [View in Google Calendar](${result.event.htmlLink})\n\nThe event has been added to your Google Calendar (${connectedCalendar}).`;
+          const actionKey = `${createIntent.summary}:${createIntent.start}`;
+          if (!hasProcessedAction(messages, 'calendar', actionKey)) {
+            console.log("Create event intent detected:", createIntent);
+            const result = await createEvent(calendarToken.token, createIntent);
+            if (result.success && result.event) {
+              actionResult += `\n\n✅ EVENT CREATED SUCCESSFULLY!\n📅 **${result.event.summary}**\n🕐 ${new Date(result.event.start).toLocaleString()} - ${new Date(result.event.end).toLocaleString()}\n🔗 [View in Google Calendar](${result.event.htmlLink})\n\nThe event has been added to your Google Calendar (${connectedCalendar}).`;
+            } else {
+              actionResult += `\n\n❌ Failed to create event: ${result.error}`;
+            }
           } else {
-            actionResult += `\n\n❌ Failed to create event: ${result.error}`;
+            console.log("Event already created, skipping duplicate");
           }
         }
-        
+
         // Check if we should fetch calendar events
         if (shouldFetchCalendar(messages) && !createIntent) {
           console.log("Calendar-related query detected, fetching events...");
