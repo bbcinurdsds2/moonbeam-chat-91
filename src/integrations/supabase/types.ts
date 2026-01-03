@@ -26,6 +26,7 @@ export type Database = {
           service: string
           session_id: string
           updated_at: string
+          user_id: string | null
         }
         Insert: {
           access_token: string
@@ -38,6 +39,7 @@ export type Database = {
           service?: string
           session_id: string
           updated_at?: string
+          user_id?: string | null
         }
         Update: {
           access_token?: string
@@ -49,6 +51,34 @@ export type Database = {
           scopes?: string[] | null
           service?: string
           session_id?: string
+          updated_at?: string
+          user_id?: string | null
+        }
+        Relationships: []
+      }
+      profiles: {
+        Row: {
+          avatar_url: string | null
+          created_at: string
+          display_name: string | null
+          email: string | null
+          id: string
+          updated_at: string
+        }
+        Insert: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          email?: string | null
+          id: string
+          updated_at?: string
+        }
+        Update: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          email?: string | null
+          id?: string
           updated_at?: string
         }
         Relationships: []

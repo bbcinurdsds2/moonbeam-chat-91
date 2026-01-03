@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-
-const SESSION_KEY = 'google_session_id';
+import { useAuth } from "./useAuth";
 
 export type GoogleService = 'gmail' | 'calendar' | 'drive';
 
@@ -9,57 +8,52 @@ interface ServiceStatus {
   email: string | null;
 }
 
-function getOrCreateSessionId(): string {
-  let sessionId = localStorage.getItem(SESSION_KEY);
-  if (!sessionId) {
-    // Also check old key for migration
-    sessionId = localStorage.getItem('gmail_session_id');
-    if (sessionId) {
-      localStorage.setItem(SESSION_KEY, sessionId);
-    } else {
-      sessionId = crypto.randomUUID();
-      localStorage.setItem(SESSION_KEY, sessionId);
-    }
-  }
-  return sessionId;
-}
-
 export const useGoogleServices = () => {
+  const { user, session, isAuthenticated } = useAuth();
   const [services, setServices] = useState<Record<GoogleService, ServiceStatus>>({
     gmail: { connected: false, email: null },
     calendar: { connected: false, email: null },
     drive: { connected: false, email: null },
   });
   const [isLoading, setIsLoading] = useState(true);
-  const sessionId = getOrCreateSessionId();
 
   const checkAllConnections = useCallback(async () => {
+    if (!session) {
+      setIsLoading(false);
+      return;
+    }
+
     try {
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth?action=check-all-status`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth?action=status`,
         {
-          method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ sessionId }),
         }
       );
 
-      const result = await response.json();
-      if (result.services) {
-        setServices(result.services);
+      if (response.ok) {
+        const result = await response.json();
+        setServices({
+          gmail: result.gmail || { connected: false, email: null },
+          calendar: result.calendar || { connected: false, email: null },
+          drive: result.drive || { connected: false, email: null },
+        });
       }
     } catch (error) {
       console.error('Error checking Google services:', error);
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId]);
+  }, [session]);
 
   useEffect(() => {
-    checkAllConnections();
+    if (!isAuthenticated || !session) {
+      setIsLoading(false);
+      return;
+    }
 
     // Check if returning from OAuth
     const urlParams = new URLSearchParams(window.location.search);
@@ -68,26 +62,30 @@ export const useGoogleServices = () => {
 
     if (code && state) {
       handleOAuthCallback(code, state);
+    } else {
+      checkAllConnections();
     }
-  }, [checkAllConnections]);
+  }, [isAuthenticated, session, checkAllConnections]);
 
   const handleOAuthCallback = async (code: string, state: string) => {
+    if (!session) return;
+
     try {
-      // Decode state to get service and sessionId
+      // Decode state to get service
       const stateData = JSON.parse(atob(state));
       const { service } = stateData;
       
       const redirectUri = `${window.location.origin}/`;
       
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth?action=exchange-code`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ code, redirectUri, sessionId, service }),
+          body: JSON.stringify({ code, state, redirectUri }),
         }
       );
 
@@ -98,27 +96,29 @@ export const useGoogleServices = () => {
           ...prev,
           [service]: { connected: true, email: result.email },
         }));
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
       }
+      
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+      await checkAllConnections();
     } catch (error) {
       console.error('Error exchanging code:', error);
     }
   };
 
   const connect = async (service: GoogleService) => {
+    if (!session) {
+      throw new Error("You must be logged in to connect services");
+    }
+
     try {
-      const redirectUri = `${window.location.origin}/`;
-      
       const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth?action=get-auth-url`,
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/google-auth?action=authorize&service=${service}`,
         {
-          method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ sessionId, redirectUri, service }),
         }
       );
 
@@ -138,7 +138,7 @@ export const useGoogleServices = () => {
   return {
     services,
     isLoading,
-    sessionId,
+    userId: user?.id,
     connect,
     isGmailConnected: services.gmail.connected,
     isCalendarConnected: services.calendar.connected,

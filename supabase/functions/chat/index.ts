@@ -9,6 +9,26 @@ const corsHeaders = {
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+// Authenticate user from request
+async function getAuthenticatedUser(req: Request) {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    return null;
+  }
+
+  return user;
+}
 
 async function refreshAccessToken(refreshToken: string): Promise<string | null> {
   const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -27,11 +47,11 @@ async function refreshAccessToken(refreshToken: string): Promise<string | null> 
   return data.access_token;
 }
 
-async function getValidToken(sessionId: string, service: string, supabase: any): Promise<{ token: string; email: string } | null> {
+async function getValidToken(userId: string, service: string, supabase: any): Promise<{ token: string; email: string } | null> {
   const { data } = await supabase
     .from('google_tokens')
     .select('*')
-    .eq('session_id', sessionId)
+    .eq('user_id', userId)
     .eq('service', service)
     .single();
 
@@ -570,14 +590,23 @@ serve(async (req) => {
   }
 
   try {
-    const { messages, sessionId } = await req.json();
+    // Validate authentication
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const { messages } = await req.json();
     const GROQ_API_KEY = Deno.env.get('GROQ_API_KEY');
     
     if (!GROQ_API_KEY) {
       throw new Error("GROQ_API_KEY is not configured");
     }
 
-    console.log("Starting chat request with", messages.length, "messages");
+    console.log("Starting chat request for user:", user.id, "with", messages.length, "messages");
 
     let emailContext = "";
     let calendarContext = "";
@@ -585,129 +614,125 @@ serve(async (req) => {
     let connectedCalendar = "";
     let actionResult = "";
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
     // Check Gmail connection and handle email operations
-    if (sessionId) {
-      const gmailToken = await getValidToken(sessionId, 'gmail', supabase);
+    const gmailToken = await getValidToken(user.id, 'gmail', supabase);
+    
+    if (gmailToken) {
+      connectedGmail = gmailToken.email;
       
-      if (gmailToken) {
-        connectedGmail = gmailToken.email;
-        
-        // Check for send email intent - but only if not already processed
-        const sendIntent = extractSendEmailIntent(messages);
-        if (sendIntent) {
-          const actionKey = `${sendIntent.to}:${sendIntent.subject}`;
-          if (!hasProcessedAction(messages, 'email', actionKey)) {
-            console.log("Send email intent detected:", sendIntent);
-            const result = await sendEmail(gmailToken.token, sendIntent);
-            if (result.success) {
-              actionResult += `\n\n✅ EMAIL SENT SUCCESSFULLY!\nTo: ${sendIntent.to}\nSubject: ${sendIntent.subject}\n\nThe email has been sent from your Gmail account (${connectedGmail}).`;
-            } else {
-              actionResult += `\n\n❌ Failed to send email: ${result.message}`;
-            }
+      // Check for send email intent - but only if not already processed
+      const sendIntent = extractSendEmailIntent(messages);
+      if (sendIntent) {
+        const actionKey = `${sendIntent.to}:${sendIntent.subject}`;
+        if (!hasProcessedAction(messages, 'email', actionKey)) {
+          console.log("Send email intent detected:", sendIntent);
+          const result = await sendEmail(gmailToken.token, sendIntent);
+          if (result.success) {
+            actionResult += `\n\n✅ EMAIL SENT SUCCESSFULLY!\nTo: ${sendIntent.to}\nSubject: ${sendIntent.subject}\n\nThe email has been sent from your Gmail account (${connectedGmail}).`;
           } else {
-            console.log("Email already sent, skipping duplicate");
+            actionResult += `\n\n❌ Failed to send email: ${result.message}`;
           }
+        } else {
+          console.log("Email already sent, skipping duplicate");
         }
+      }
+      
+      // Check if we should fetch emails
+      if (shouldFetchEmails(messages) && !sendIntent) {
+        console.log("Email-related query detected, fetching emails...");
+        const emails = await fetchEmails(gmailToken.token, undefined, 10);
         
-        // Check if we should fetch emails
-        if (shouldFetchEmails(messages) && !sendIntent) {
-          console.log("Email-related query detected, fetching emails...");
-          const emails = await fetchEmails(gmailToken.token, undefined, 10);
-          
-          if (emails.length > 0) {
-            emailContext = `\n\nThe user has connected their Gmail account (${connectedGmail}). Here are their recent emails:\n\n`;
-            emailContext += `| # | From | Subject | Date |\n`;
-            emailContext += `|---|------|---------|------|\n`;
-            emails.forEach((email: any, index: number) => {
-              const fromName = email.from.replace(/<[^>]+>/g, '').trim().substring(0, 25);
-              const subjectShort = email.subject.substring(0, 50);
-              const dateShort = new Date(email.date).toLocaleString('en-US', { 
-                month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' 
-              });
-              emailContext += `| ${index + 1} | ${fromName} | ${subjectShort} | ${dateShort} |\n`;
+        if (emails.length > 0) {
+          emailContext = `\n\nThe user has connected their Gmail account (${connectedGmail}). Here are their recent emails:\n\n`;
+          emailContext += `| # | From | Subject | Date |\n`;
+          emailContext += `|---|------|---------|------|\n`;
+          emails.forEach((email: any, index: number) => {
+            const fromName = email.from.replace(/<[^>]+>/g, '').trim().substring(0, 25);
+            const subjectShort = email.subject.substring(0, 50);
+            const dateShort = new Date(email.date).toLocaleString('en-US', { 
+              month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' 
             });
-          }
+            emailContext += `| ${index + 1} | ${fromName} | ${subjectShort} | ${dateShort} |\n`;
+          });
         }
-      } else if (shouldFetchEmails(messages)) {
-        emailContext = "\n\nNote: The user asked about emails but Gmail is not connected. Suggest they connect Gmail using the connectors menu.";
+      }
+    } else if (shouldFetchEmails(messages)) {
+      emailContext = "\n\nNote: The user asked about emails but Gmail is not connected. Suggest they connect Gmail using the connectors menu.";
+    }
+
+    // Check Calendar connection and handle calendar operations
+    const calendarToken = await getValidToken(user.id, 'calendar', supabase);
+    
+    if (calendarToken) {
+      connectedCalendar = calendarToken.email;
+      
+      // Check for create event intent - but only if not already processed
+      const createIntent = extractCreateEventIntent(messages);
+      if (createIntent) {
+        const actionKey = `${createIntent.summary}:${createIntent.start}`;
+        if (!hasProcessedAction(messages, 'calendar', actionKey)) {
+          console.log("Create event intent detected:", createIntent);
+          const result = await createEvent(calendarToken.token, createIntent);
+          if (result.success && result.event) {
+            actionResult += `\n\n✅ EVENT CREATED SUCCESSFULLY!\n📅 **${result.event.summary}**\n🕐 ${new Date(result.event.start).toLocaleString()} - ${new Date(result.event.end).toLocaleString()}\n🔗 [View in Google Calendar](${result.event.htmlLink})\n\nThe event has been added to your Google Calendar (${connectedCalendar}).`;
+          } else {
+            actionResult += `\n\n❌ Failed to create event: ${result.error}`;
+          }
+        } else {
+          console.log("Event already created, skipping duplicate");
+        }
       }
 
-      // Check Calendar connection and handle calendar operations
-      const calendarToken = await getValidToken(sessionId, 'calendar', supabase);
-      
-      if (calendarToken) {
-        connectedCalendar = calendarToken.email;
+      // Check if we should fetch calendar events
+      if (shouldFetchCalendar(messages) && !createIntent) {
+        console.log("Calendar-related query detected, fetching events...");
         
-        // Check for create event intent - but only if not already processed
-        const createIntent = extractCreateEventIntent(messages);
-        if (createIntent) {
-          const actionKey = `${createIntent.summary}:${createIntent.start}`;
-          if (!hasProcessedAction(messages, 'calendar', actionKey)) {
-            console.log("Create event intent detected:", createIntent);
-            const result = await createEvent(calendarToken.token, createIntent);
-            if (result.success && result.event) {
-              actionResult += `\n\n✅ EVENT CREATED SUCCESSFULLY!\n📅 **${result.event.summary}**\n🕐 ${new Date(result.event.start).toLocaleString()} - ${new Date(result.event.end).toLocaleString()}\n🔗 [View in Google Calendar](${result.event.htmlLink})\n\nThe event has been added to your Google Calendar (${connectedCalendar}).`;
-            } else {
-              actionResult += `\n\n❌ Failed to create event: ${result.error}`;
-            }
-          } else {
-            console.log("Event already created, skipping duplicate");
-          }
+        // Determine time range based on query
+        const lastMsg = messages.filter((m: any) => m.role === 'user').pop()?.content.toLowerCase() || '';
+        let timeMax: string | undefined;
+        const now = new Date();
+        
+        if (lastMsg.includes('today')) {
+          const endOfDay = new Date(now);
+          endOfDay.setHours(23, 59, 59, 999);
+          timeMax = endOfDay.toISOString();
+        } else if (lastMsg.includes('tomorrow')) {
+          const tomorrow = new Date(now);
+          tomorrow.setDate(tomorrow.getDate() + 1);
+          tomorrow.setHours(23, 59, 59, 999);
+          timeMax = tomorrow.toISOString();
+        } else if (lastMsg.includes('this week')) {
+          const endOfWeek = new Date(now);
+          endOfWeek.setDate(endOfWeek.getDate() + (7 - endOfWeek.getDay()));
+          timeMax = endOfWeek.toISOString();
+        } else if (lastMsg.includes('next week')) {
+          const nextWeekEnd = new Date(now);
+          nextWeekEnd.setDate(nextWeekEnd.getDate() + 14);
+          timeMax = nextWeekEnd.toISOString();
         }
-
-        // Check if we should fetch calendar events
-        if (shouldFetchCalendar(messages) && !createIntent) {
-          console.log("Calendar-related query detected, fetching events...");
-          
-          // Determine time range based on query
-          const lastMsg = messages.filter((m: any) => m.role === 'user').pop()?.content.toLowerCase() || '';
-          let timeMax: string | undefined;
-          const now = new Date();
-          
-          if (lastMsg.includes('today')) {
-            const endOfDay = new Date(now);
-            endOfDay.setHours(23, 59, 59, 999);
-            timeMax = endOfDay.toISOString();
-          } else if (lastMsg.includes('tomorrow')) {
-            const tomorrow = new Date(now);
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            tomorrow.setHours(23, 59, 59, 999);
-            timeMax = tomorrow.toISOString();
-          } else if (lastMsg.includes('this week')) {
-            const endOfWeek = new Date(now);
-            endOfWeek.setDate(endOfWeek.getDate() + (7 - endOfWeek.getDay()));
-            timeMax = endOfWeek.toISOString();
-          } else if (lastMsg.includes('next week')) {
-            const nextWeekEnd = new Date(now);
-            nextWeekEnd.setDate(nextWeekEnd.getDate() + 14);
-            timeMax = nextWeekEnd.toISOString();
-          }
-          
-          const events = await listEvents(calendarToken.token, { timeMax, maxResults: 15 });
-          
-          if (events.length > 0) {
-            calendarContext = `\n\nThe user has connected their Google Calendar (${connectedCalendar}). Here are their upcoming events:\n\n`;
-            calendarContext += `| # | Event | Date & Time | Location |\n`;
-            calendarContext += `|---|-------|-------------|----------|\n`;
-            events.forEach((event: any, index: number) => {
-              const startDate = new Date(event.start);
-              const dateStr = event.allDay 
-                ? startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' (All day)'
-                : startDate.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-              const location = event.location ? event.location.substring(0, 20) : '-';
-              calendarContext += `| ${index + 1} | ${event.summary.substring(0, 35)} | ${dateStr} | ${location} |\n`;
-            });
-          } else {
-            calendarContext = `\n\nThe user has connected their Google Calendar (${connectedCalendar}), but they have no upcoming events in the requested time period.`;
-          }
+        
+        const events = await listEvents(calendarToken.token, { timeMax, maxResults: 15 });
+        
+        if (events.length > 0) {
+          calendarContext = `\n\nThe user has connected their Google Calendar (${connectedCalendar}). Here are their upcoming events:\n\n`;
+          calendarContext += `| # | Event | Date & Time | Location |\n`;
+          calendarContext += `|---|-------|-------------|----------|\n`;
+          events.forEach((event: any, index: number) => {
+            const startDate = new Date(event.start);
+            const dateStr = event.allDay 
+              ? startDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' (All day)'
+              : startDate.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            const location = event.location ? event.location.substring(0, 20) : '-';
+            calendarContext += `| ${index + 1} | ${event.summary.substring(0, 35)} | ${dateStr} | ${location} |\n`;
+          });
+        } else {
+          calendarContext = `\n\nThe user has connected their Google Calendar (${connectedCalendar}), but they have no upcoming events in the requested time period.`;
         }
-      } else if (shouldFetchCalendar(messages)) {
-        calendarContext = "\n\nNote: The user asked about calendar/events but Google Calendar is not connected. Suggest they connect Google Calendar using the connectors menu.";
       }
+    } else if (shouldFetchCalendar(messages)) {
+      calendarContext = "\n\nNote: The user asked about calendar/events but Google Calendar is not connected. Suggest they connect Google Calendar using the connectors menu.";
     }
 
     const systemPrompt = `You are Akronom, an advanced AI assistant. Your name is Akronom. You help users with tasks, answer questions, and provide thoughtful, comprehensive responses. Be helpful, concise when appropriate, and thorough when needed.

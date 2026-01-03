@@ -8,6 +8,8 @@ const corsHeaders = {
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 
 // Service-specific scopes
 const SERVICE_SCOPES: Record<string, string[]> = {
@@ -29,12 +31,40 @@ const SERVICE_SCOPES: Record<string, string[]> = {
   ],
 };
 
+// Authenticate user from request
+async function getAuthenticatedUser(req: Request) {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    console.log("Auth validation failed:", error?.message);
+    return null;
+  }
+
+  return user;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
+    // Validate authentication
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     const url = new URL(req.url);
     const action = url.searchParams.get('action');
 
@@ -47,15 +77,13 @@ serve(async (req) => {
       });
     }
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
     // Generate OAuth URL for specific service
-    if (action === 'get-auth-url') {
-      const { sessionId, redirectUri, service } = await req.json();
-      
+    if (action === 'authorize') {
+      const service = url.searchParams.get('service') || 'gmail';
       const scopes = SERVICE_SCOPES[service];
+      
       if (!scopes) {
         return new Response(JSON.stringify({ error: `Unknown service: ${service}` }), {
           status: 400,
@@ -63,8 +91,14 @@ serve(async (req) => {
         });
       }
 
-      // Include service in state so we know which service on callback
-      const state = JSON.stringify({ sessionId, service });
+      const redirectUri = `${url.origin.replace('/functions/v1/google-auth', '')}/`;
+      
+      // Include service and user ID in state for security
+      const state = btoa(JSON.stringify({ 
+        service, 
+        userId: user.id,
+        timestamp: Date.now() 
+      }));
 
       const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
       authUrl.searchParams.set('client_id', GOOGLE_CLIENT_ID);
@@ -73,20 +107,76 @@ serve(async (req) => {
       authUrl.searchParams.set('scope', scopes.join(' '));
       authUrl.searchParams.set('access_type', 'offline');
       authUrl.searchParams.set('prompt', 'consent');
-      authUrl.searchParams.set('state', btoa(state));
+      authUrl.searchParams.set('state', state);
 
-      console.log(`Generated auth URL for service: ${service}`);
+      console.log(`Generated auth URL for service: ${service}, user: ${user.id}`);
 
       return new Response(JSON.stringify({ authUrl: authUrl.toString() }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Exchange code for tokens
-    if (action === 'exchange-code') {
-      const { code, redirectUri, sessionId, service } = await req.json();
+    // Check all services status
+    if (action === 'status') {
+      const { data } = await supabase
+        .from('google_tokens')
+        .select('service, email, expires_at')
+        .eq('user_id', user.id);
 
-      console.log(`Exchanging code for service: ${service}, sessionId: ${sessionId}`);
+      const services: Record<string, { connected: boolean; email: string | null }> = {
+        gmail: { connected: false, email: null },
+        calendar: { connected: false, email: null },
+        drive: { connected: false, email: null },
+      };
+
+      if (data) {
+        for (const token of data) {
+          const isExpired = new Date(token.expires_at) < new Date();
+          services[token.service] = {
+            connected: !isExpired,
+            email: token.email,
+          };
+        }
+      }
+
+      return new Response(JSON.stringify(services), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Exchange code for tokens (POST)
+    if (req.method === 'POST') {
+      const { code, state, redirectUri } = await req.json();
+
+      if (!code || !state) {
+        return new Response(JSON.stringify({ error: 'Missing code or state' }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Decode and validate state
+      let stateData: { service: string; userId: string };
+      try {
+        stateData = JSON.parse(atob(state));
+      } catch {
+        return new Response(JSON.stringify({ error: 'Invalid state' }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Verify user matches state
+      if (stateData.userId !== user.id) {
+        console.error("User mismatch: state userId", stateData.userId, "vs auth user", user.id);
+        return new Response(JSON.stringify({ error: 'User mismatch' }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      const service = stateData.service;
+      console.log(`Exchanging code for service: ${service}, user: ${user.id}`);
 
       const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
@@ -111,7 +201,7 @@ serve(async (req) => {
 
       const tokens = await tokenResponse.json();
       
-      // Get user email
+      // Get user email from Google
       const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
       });
@@ -120,11 +210,11 @@ serve(async (req) => {
       const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
       const scopes = SERVICE_SCOPES[service] || [];
 
-      // Check if entry exists for this session + service
+      // Check if entry exists for this user + service
       const { data: existing } = await supabase
         .from('google_tokens')
         .select('id')
-        .eq('session_id', sessionId)
+        .eq('user_id', user.id)
         .eq('service', service)
         .single();
 
@@ -140,7 +230,7 @@ serve(async (req) => {
       } else {
         // Insert new
         await supabase.from('google_tokens').insert({
-          session_id: sessionId,
+          user_id: user.id,
           service,
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
@@ -157,63 +247,6 @@ serve(async (req) => {
         email: userInfo.email,
         service,
       }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // Check connection status for a service
-    if (action === 'check-status') {
-      const { sessionId, service } = await req.json();
-      
-      const { data } = await supabase
-        .from('google_tokens')
-        .select('email, expires_at')
-        .eq('session_id', sessionId)
-        .eq('service', service)
-        .single();
-
-      if (data) {
-        const isExpired = new Date(data.expires_at) < new Date();
-        return new Response(JSON.stringify({ 
-          connected: !isExpired, 
-          email: data.email,
-          service,
-        }), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
-
-      return new Response(JSON.stringify({ connected: false, service }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    // Check all services status
-    if (action === 'check-all-status') {
-      const { sessionId } = await req.json();
-      
-      const { data } = await supabase
-        .from('google_tokens')
-        .select('service, email, expires_at')
-        .eq('session_id', sessionId);
-
-      const services: Record<string, { connected: boolean; email: string | null }> = {
-        gmail: { connected: false, email: null },
-        calendar: { connected: false, email: null },
-        drive: { connected: false, email: null },
-      };
-
-      if (data) {
-        for (const token of data) {
-          const isExpired = new Date(token.expires_at) < new Date();
-          services[token.service] = {
-            connected: !isExpired,
-            email: token.email,
-          };
-        }
-      }
-
-      return new Response(JSON.stringify({ services }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
