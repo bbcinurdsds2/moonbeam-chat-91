@@ -59,6 +59,17 @@ export const useAuth = () => {
     return { data, error };
   }, []);
 
+  const signInWithGoogle = useCallback(async () => {
+    const { data, error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: {
+        redirectTo: `${window.location.origin}/`,
+      }
+    });
+    
+    return { data, error };
+  }, []);
+
   const signOut = useCallback(async () => {
     const { error } = await supabase.auth.signOut();
     return { error };
@@ -70,6 +81,7 @@ export const useAuth = () => {
     isLoading,
     signUp,
     signIn,
+    signInWithGoogle,
     signOut,
     isAuthenticated: !!session,
   };
