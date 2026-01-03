@@ -136,7 +136,9 @@ serve(async (req) => {
         });
       }
 
-      const redirectUri = `${url.origin.replace('/functions/v1/google-auth', '')}/`;
+      // Use origin from request header or fallback to Supabase auth callback
+      const origin = req.headers.get('origin') || `${SUPABASE_URL}/auth/v1/callback`;
+      const redirectUri = `${origin}/`;
       
       // Include service and user ID in state for security
       const state = btoa(JSON.stringify({ 
