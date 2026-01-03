@@ -1,40 +1,30 @@
 import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
-
-const SESSION_KEY = 'gmail_session_id';
-
-function getOrCreateSessionId(): string {
-  let sessionId = localStorage.getItem(SESSION_KEY);
-  if (!sessionId) {
-    sessionId = crypto.randomUUID();
-    localStorage.setItem(SESSION_KEY, sessionId);
-  }
-  return sessionId;
-}
+import { useAuth } from "./useAuth";
 
 export const useGmail = () => {
   const [isConnected, setIsConnected] = useState(false);
   const [connectedEmail, setConnectedEmail] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const sessionId = getOrCreateSessionId();
+  const { session } = useAuth();
 
   const checkConnection = useCallback(async () => {
-    try {
-      const { data, error } = await supabase.functions.invoke('gmail-auth', {
-        body: { sessionId },
-        headers: { 'Content-Type': 'application/json' },
-      });
+    if (!session?.access_token) {
+      setIsConnected(false);
+      setIsLoading(false);
+      return;
+    }
 
-      // Add action as query param workaround
+    try {
       const response = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/gmail-auth?action=check-status`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ sessionId }),
+          body: JSON.stringify({}),
         }
       );
 
@@ -47,7 +37,7 @@ export const useGmail = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId]);
+  }, [session?.access_token]);
 
   useEffect(() => {
     checkConnection();
@@ -57,12 +47,14 @@ export const useGmail = () => {
     const code = urlParams.get('code');
     const state = urlParams.get('state');
 
-    if (code && state === sessionId) {
-      handleOAuthCallback(code);
+    if (code && state && session?.access_token) {
+      handleOAuthCallback(code, state);
     }
-  }, [checkConnection, sessionId]);
+  }, [checkConnection, session?.access_token]);
 
-  const handleOAuthCallback = async (code: string) => {
+  const handleOAuthCallback = async (code: string, state: string) => {
+    if (!session?.access_token) return;
+
     try {
       const redirectUri = `${window.location.origin}/`;
       
@@ -72,9 +64,9 @@ export const useGmail = () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ code, redirectUri, sessionId }),
+          body: JSON.stringify({ code, redirectUri, state }),
         }
       );
 
@@ -92,6 +84,10 @@ export const useGmail = () => {
   };
 
   const connect = async () => {
+    if (!session?.access_token) {
+      throw new Error('Must be logged in to connect Gmail');
+    }
+
     try {
       const redirectUri = `${window.location.origin}/`;
       
@@ -101,9 +97,9 @@ export const useGmail = () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+            'Authorization': `Bearer ${session.access_token}`,
           },
-          body: JSON.stringify({ sessionId, redirectUri }),
+          body: JSON.stringify({ redirectUri }),
         }
       );
 
@@ -121,16 +117,19 @@ export const useGmail = () => {
   };
 
   const getEmails = async (query?: string, maxResults = 10) => {
+    if (!session?.access_token) {
+      throw new Error('Must be logged in to access emails');
+    }
+
     const response = await fetch(
       `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/gmail-api`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({ 
-          sessionId, 
           action: 'list',
           params: { query, maxResults }
         }),
@@ -141,16 +140,19 @@ export const useGmail = () => {
   };
 
   const readEmail = async (messageId: string) => {
+    if (!session?.access_token) {
+      throw new Error('Must be logged in to read emails');
+    }
+
     const response = await fetch(
       `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/gmail-api`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({ 
-          sessionId, 
           action: 'read',
           params: { messageId }
         }),
@@ -167,6 +169,5 @@ export const useGmail = () => {
     connect,
     getEmails,
     readEmail,
-    sessionId,
   };
 };

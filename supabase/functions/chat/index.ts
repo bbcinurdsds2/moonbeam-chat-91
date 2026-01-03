@@ -1,6 +1,7 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -24,6 +25,16 @@ const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+// Input validation schema for chat messages
+const MessageSchema = z.object({
+  role: z.enum(['user', 'assistant', 'system']),
+  content: z.string().min(1).max(50000),
+});
+
+const ChatRequestSchema = z.object({
+  messages: z.array(MessageSchema).min(1).max(100),
+});
 
 // Authenticate user from request
 async function getAuthenticatedUser(req: Request) {
@@ -614,14 +625,28 @@ serve(async (req) => {
       });
     }
 
-    const { messages } = await req.json();
+    const body = await req.json();
+    
+    // Validate input
+    const validation = ChatRequestSchema.safeParse(body);
+    if (!validation.success) {
+      return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    
+    const { messages } = validation.data;
     const GROQ_API_KEY = Deno.env.get('GROQ_API_KEY');
     
     if (!GROQ_API_KEY) {
-      throw new Error("GROQ_API_KEY is not configured");
+      return new Response(JSON.stringify({ error: "AI service not configured" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log("Starting chat request for user:", user.id, "with", messages.length, "messages");
+    console.log("Chat request for user with", messages.length, "messages");
 
     let emailContext = "";
     let calendarContext = "";
@@ -812,7 +837,7 @@ ${emailContext}${calendarContext}${actionResult}`;
     });
   } catch (error) {
     console.error("Chat function error:", error);
-    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), {
+    return new Response(JSON.stringify({ error: "An error occurred" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -21,6 +22,66 @@ function getCorsHeaders(req: Request) {
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+// Input validation schemas
+const ListCalendarsSchema = z.object({
+  calendarId: z.string().max(200).optional(),
+});
+
+const ListEventsSchema = z.object({
+  calendarId: z.string().max(200).optional(),
+  timeMin: z.string().datetime().optional(),
+  timeMax: z.string().datetime().optional(),
+  maxResults: z.number().int().min(1).max(100).optional(),
+  query: z.string().max(500).optional(),
+});
+
+const CreateEventSchema = z.object({
+  calendarId: z.string().max(200).optional(),
+  summary: z.string().min(1).max(200),
+  description: z.string().max(5000).optional(),
+  location: z.string().max(200).optional(),
+  start: z.string().min(1).max(50),
+  end: z.string().min(1).max(50),
+  allDay: z.boolean().optional(),
+  attendees: z.array(z.string().email()).max(50).optional(),
+});
+
+const UpdateEventSchema = z.object({
+  calendarId: z.string().max(200).optional(),
+  eventId: z.string().min(1).max(200),
+  summary: z.string().min(1).max(200).optional(),
+  description: z.string().max(5000).optional(),
+  location: z.string().max(200).optional(),
+  start: z.string().max(50).optional(),
+  end: z.string().max(50).optional(),
+  allDay: z.boolean().optional(),
+});
+
+const DeleteEventSchema = z.object({
+  calendarId: z.string().max(200).optional(),
+  eventId: z.string().min(1).max(200),
+});
+
+// Authenticate user from request
+async function getAuthenticatedUser(req: Request) {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    return null;
+  }
+
+  return user;
+}
 
 async function refreshAccessToken(refreshToken: string): Promise<string | null> {
   const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -39,23 +100,21 @@ async function refreshAccessToken(refreshToken: string): Promise<string | null> 
   return data.access_token;
 }
 
-async function getValidToken(sessionId: string, supabase: any): Promise<{ token: string; email: string } | null> {
+async function getValidToken(userId: string, supabase: any): Promise<{ token: string; email: string } | null> {
   const { data } = await supabase
     .from('google_tokens')
     .select('*')
-    .eq('session_id', sessionId)
+    .eq('user_id', userId)
     .eq('service', 'calendar')
     .single();
 
   if (!data) {
-    console.log("No calendar token found for session:", sessionId);
     return null;
   }
 
   const isExpired = new Date(data.expires_at) < new Date();
   
   if (isExpired && data.refresh_token) {
-    console.log("Token expired, refreshing...");
     const newToken = await refreshAccessToken(data.refresh_token);
     if (newToken) {
       const expiresAt = new Date(Date.now() + 3600 * 1000);
@@ -79,7 +138,6 @@ async function listCalendars(token: string) {
   );
   
   if (!response.ok) {
-    console.error("Failed to list calendars:", await response.text());
     return [];
   }
   
@@ -96,7 +154,6 @@ async function listEvents(token: string, calendarId = 'primary', options: {
 } = {}) {
   const params = new URLSearchParams();
   
-  // Default to showing upcoming events from now
   const now = new Date().toISOString();
   params.set('timeMin', options.timeMin || now);
   
@@ -113,14 +170,12 @@ async function listEvents(token: string, calendarId = 'primary', options: {
   }
 
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params}`;
-  console.log("Fetching events from:", url);
   
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
   
   if (!response.ok) {
-    console.error("Failed to list events:", await response.text());
     return [];
   }
   
@@ -160,7 +215,6 @@ async function createEvent(token: string, calendarId = 'primary', eventData: {
   };
 
   if (eventData.allDay) {
-    // For all-day events, use date format (YYYY-MM-DD)
     event.start = { date: eventData.start.split('T')[0] };
     event.end = { date: eventData.end.split('T')[0] };
   } else {
@@ -171,8 +225,6 @@ async function createEvent(token: string, calendarId = 'primary', eventData: {
   if (eventData.attendees && eventData.attendees.length > 0) {
     event.attendees = eventData.attendees.map(email => ({ email }));
   }
-
-  console.log("Creating event:", JSON.stringify(event));
 
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`,
@@ -187,13 +239,10 @@ async function createEvent(token: string, calendarId = 'primary', eventData: {
   );
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error("Failed to create event:", errorText);
-    return { success: false, error: errorText };
+    return { success: false, error: 'Failed to create event' };
   }
 
   const createdEvent = await response.json();
-  console.log("Event created:", createdEvent.id);
   
   return {
     success: true,
@@ -218,7 +267,7 @@ async function updateEvent(token: string, calendarId = 'primary', eventId: strin
 }) {
   // First, get the existing event
   const getResponse = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${eventId}`,
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
 
@@ -247,7 +296,7 @@ async function updateEvent(token: string, calendarId = 'primary', eventId: strin
   }
 
   const response = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${eventId}`,
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     {
       method: 'PUT',
       headers: {
@@ -259,9 +308,7 @@ async function updateEvent(token: string, calendarId = 'primary', eventId: strin
   );
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error("Failed to update event:", errorText);
-    return { success: false, error: errorText };
+    return { success: false, error: 'Failed to update event' };
   }
 
   const result = await response.json();
@@ -271,7 +318,7 @@ async function updateEvent(token: string, calendarId = 'primary', eventId: strin
 // Delete an event
 async function deleteEvent(token: string, calendarId = 'primary', eventId: string) {
   const response = await fetch(
-    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${eventId}`,
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
@@ -279,9 +326,7 @@ async function deleteEvent(token: string, calendarId = 'primary', eventId: strin
   );
 
   if (!response.ok && response.status !== 204) {
-    const errorText = await response.text();
-    console.error("Failed to delete event:", errorText);
-    return { success: false, error: errorText };
+    return { success: false, error: 'Failed to delete event' };
   }
 
   return { success: true };
@@ -295,24 +340,22 @@ serve(async (req) => {
   }
 
   try {
-    const url = new URL(req.url);
-    const action = url.searchParams.get('action');
-    const { sessionId, ...params } = await req.json();
-
-    console.log(`Calendar API action: ${action}, sessionId: ${sessionId}`);
-
-    if (!sessionId) {
-      return new Response(JSON.stringify({ error: 'Session ID required' }), {
-        status: 400,
+    // Validate authentication
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const url = new URL(req.url);
+    const action = url.searchParams.get('action');
+    const body = await req.json();
 
-    const tokenData = await getValidToken(sessionId, supabase);
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+    const tokenData = await getValidToken(user.id, supabase);
     
     if (!tokenData) {
       return new Response(JSON.stringify({ 
@@ -327,11 +370,27 @@ serve(async (req) => {
     let result: any;
 
     switch (action) {
-      case 'list-calendars':
+      case 'list-calendars': {
+        const validation = ListCalendarsSchema.safeParse(body);
+        if (!validation.success) {
+          return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
         result = await listCalendars(tokenData.token);
         break;
+      }
 
-      case 'list-events':
+      case 'list-events': {
+        const validation = ListEventsSchema.safeParse(body);
+        if (!validation.success) {
+          return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        const params = validation.data;
         result = await listEvents(tokenData.token, params.calendarId, {
           timeMin: params.timeMin,
           timeMax: params.timeMax,
@@ -339,8 +398,17 @@ serve(async (req) => {
           query: params.query,
         });
         break;
+      }
 
-      case 'create-event':
+      case 'create-event': {
+        const validation = CreateEventSchema.safeParse(body);
+        if (!validation.success) {
+          return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        const params = validation.data;
         result = await createEvent(tokenData.token, params.calendarId, {
           summary: params.summary,
           description: params.description,
@@ -351,8 +419,17 @@ serve(async (req) => {
           attendees: params.attendees,
         });
         break;
+      }
 
-      case 'update-event':
+      case 'update-event': {
+        const validation = UpdateEventSchema.safeParse(body);
+        if (!validation.success) {
+          return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        const params = validation.data;
         result = await updateEvent(tokenData.token, params.calendarId, params.eventId, {
           summary: params.summary,
           description: params.description,
@@ -362,10 +439,20 @@ serve(async (req) => {
           allDay: params.allDay,
         });
         break;
+      }
 
-      case 'delete-event':
+      case 'delete-event': {
+        const validation = DeleteEventSchema.safeParse(body);
+        if (!validation.success) {
+          return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        const params = validation.data;
         result = await deleteEvent(tokenData.token, params.calendarId, params.eventId);
         break;
+      }
 
       default:
         return new Response(JSON.stringify({ error: 'Invalid action' }), {
@@ -383,9 +470,7 @@ serve(async (req) => {
     });
   } catch (error) {
     console.error("Calendar API error:", error);
-    return new Response(JSON.stringify({ 
-      error: error instanceof Error ? error.message : 'Unknown error' 
-    }), {
+    return new Response(JSON.stringify({ error: 'An error occurred' }), {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });

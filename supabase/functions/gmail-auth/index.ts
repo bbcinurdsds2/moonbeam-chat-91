@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -21,6 +22,38 @@ function getCorsHeaders(req: Request) {
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+// Input validation schemas
+const GetAuthUrlSchema = z.object({
+  redirectUri: z.string().url().max(500),
+});
+
+const ExchangeCodeSchema = z.object({
+  code: z.string().min(1).max(500),
+  redirectUri: z.string().url().max(500),
+  state: z.string().min(1).max(1000),
+});
+
+// Authenticate user from request
+async function getAuthenticatedUser(req: Request) {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    console.log("Auth validation failed");
+    return null;
+  }
+
+  return user;
+}
 
 serve(async (req) => {
   const corsHeaders = getCorsHeaders(req);
@@ -30,21 +63,42 @@ serve(async (req) => {
   }
 
   try {
+    // Validate authentication for all requests
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
     const url = new URL(req.url);
     const action = url.searchParams.get('action');
 
     if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
       return new Response(JSON.stringify({ 
-        error: "Google OAuth not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET." 
+        error: "Google OAuth not configured" 
       }), {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
     // Generate OAuth URL for Gmail access
     if (action === 'get-auth-url') {
-      const { sessionId, redirectUri } = await req.json();
+      const body = await req.json();
+      const validation = GetAuthUrlSchema.safeParse(body);
+      
+      if (!validation.success) {
+        return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      
+      const { redirectUri } = validation.data;
       
       const scopes = [
         'https://www.googleapis.com/auth/gmail.readonly',
@@ -53,6 +107,13 @@ serve(async (req) => {
         'https://www.googleapis.com/auth/userinfo.email',
       ];
 
+      // Include user ID in state for security validation
+      const state = btoa(JSON.stringify({ 
+        userId: user.id,
+        service: 'gmail',
+        timestamp: Date.now() 
+      }));
+
       const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
       authUrl.searchParams.set('client_id', GOOGLE_CLIENT_ID);
       authUrl.searchParams.set('redirect_uri', redirectUri);
@@ -60,7 +121,9 @@ serve(async (req) => {
       authUrl.searchParams.set('scope', scopes.join(' '));
       authUrl.searchParams.set('access_type', 'offline');
       authUrl.searchParams.set('prompt', 'consent');
-      authUrl.searchParams.set('state', sessionId);
+      authUrl.searchParams.set('state', state);
+
+      console.log(`Generated Gmail auth URL for user: ${user.id}`);
 
       return new Response(JSON.stringify({ authUrl: authUrl.toString() }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -69,7 +132,37 @@ serve(async (req) => {
 
     // Exchange code for tokens
     if (action === 'exchange-code') {
-      const { code, redirectUri, sessionId } = await req.json();
+      const body = await req.json();
+      const validation = ExchangeCodeSchema.safeParse(body);
+      
+      if (!validation.success) {
+        return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+      
+      const { code, redirectUri, state } = validation.data;
+
+      // Decode and validate state
+      let stateData: { userId: string; service: string; timestamp: number };
+      try {
+        stateData = JSON.parse(atob(state));
+      } catch {
+        return new Response(JSON.stringify({ error: 'Invalid state' }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
+      // Verify user matches state
+      if (stateData.userId !== user.id) {
+        console.error("User mismatch in OAuth callback");
+        return new Response(JSON.stringify({ error: 'User mismatch' }), {
+          status: 403,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
       const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
@@ -84,8 +177,7 @@ serve(async (req) => {
       });
 
       if (!tokenResponse.ok) {
-        const error = await tokenResponse.text();
-        console.error("Token exchange error:", error);
+        console.error("Token exchange failed");
         return new Response(JSON.stringify({ error: "Failed to exchange code" }), {
           status: 400,
           headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -100,21 +192,35 @@ serve(async (req) => {
       });
       const userInfo = await userInfoResponse.json();
 
-      // Store tokens in database
-      const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-      const supabase = createClient(supabaseUrl, supabaseKey);
-
       const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
 
-      await supabase.from('google_tokens').upsert({
-        session_id: sessionId,
-        service: 'gmail',
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        expires_at: expiresAt.toISOString(),
-        email: userInfo.email,
-      }, { onConflict: 'session_id' });
+      // Check if entry exists for this user + service
+      const { data: existing } = await supabase
+        .from('google_tokens')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('service', 'gmail')
+        .single();
+
+      if (existing) {
+        await supabase.from('google_tokens').update({
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token || undefined,
+          expires_at: expiresAt.toISOString(),
+          email: userInfo.email,
+        }).eq('id', existing.id);
+      } else {
+        await supabase.from('google_tokens').insert({
+          user_id: user.id,
+          service: 'gmail',
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          expires_at: expiresAt.toISOString(),
+          email: userInfo.email,
+        });
+      }
+
+      console.log(`Successfully stored Gmail tokens for user: ${user.id}`);
 
       return new Response(JSON.stringify({ 
         success: true, 
@@ -126,16 +232,10 @@ serve(async (req) => {
 
     // Check connection status
     if (action === 'check-status') {
-      const { sessionId } = await req.json();
-      
-      const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-      const supabase = createClient(supabaseUrl, supabaseKey);
-
       const { data } = await supabase
         .from('google_tokens')
         .select('email, expires_at')
-        .eq('session_id', sessionId)
+        .eq('user_id', user.id)
         .eq('service', 'gmail')
         .single();
 
@@ -160,7 +260,7 @@ serve(async (req) => {
     });
   } catch (error) {
     console.error("Gmail auth error:", error);
-    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), {
+    return new Response(JSON.stringify({ error: "An error occurred" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

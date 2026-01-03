@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -21,6 +22,57 @@ function getCorsHeaders(req: Request) {
 
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+
+// Input validation schemas
+const ListEmailsSchema = z.object({
+  action: z.literal('list'),
+  params: z.object({
+    query: z.string().max(500).optional(),
+    maxResults: z.number().int().min(1).max(50).optional(),
+  }).optional(),
+});
+
+const ReadEmailSchema = z.object({
+  action: z.literal('read'),
+  params: z.object({
+    messageId: z.string().min(1).max(100),
+  }),
+});
+
+const SendEmailSchema = z.object({
+  action: z.literal('send'),
+  params: z.object({
+    to: z.string().email().max(254),
+    subject: z.string().min(1).max(200),
+    body: z.string().min(1).max(50000),
+  }),
+});
+
+const RequestSchema = z.discriminatedUnion('action', [
+  ListEmailsSchema,
+  ReadEmailSchema,
+  SendEmailSchema,
+]);
+
+// Authenticate user from request
+async function getAuthenticatedUser(req: Request) {
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return null;
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const { data: { user }, error } = await supabase.auth.getUser(token);
+  if (error || !user) {
+    return null;
+  }
+
+  return user;
+}
 
 async function refreshAccessToken(refreshToken: string): Promise<string | null> {
   const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -39,11 +91,11 @@ async function refreshAccessToken(refreshToken: string): Promise<string | null> 
   return data.access_token;
 }
 
-async function getValidToken(sessionId: string, supabase: any): Promise<{ token: string; email: string } | null> {
+async function getValidToken(userId: string, supabase: any): Promise<{ token: string; email: string } | null> {
   const { data } = await supabase
     .from('google_tokens')
     .select('*')
-    .eq('session_id', sessionId)
+    .eq('user_id', userId)
     .eq('service', 'gmail')
     .single();
 
@@ -58,7 +110,7 @@ async function getValidToken(sessionId: string, supabase: any): Promise<{ token:
       await supabase.from('google_tokens').update({
         access_token: newToken,
         expires_at: expiresAt.toISOString(),
-      }).eq('session_id', sessionId).eq('service', 'gmail');
+      }).eq('user_id', userId).eq('service', 'gmail');
       return { token: newToken, email: data.email };
     }
     return null;
@@ -75,13 +127,31 @@ serve(async (req) => {
   }
 
   try {
-    const { sessionId, action, params } = await req.json();
+    // Validate authentication
+    const user = await getAuthenticatedUser(req);
+    if (!user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
-    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const body = await req.json();
+    
+    // Validate input
+    const validation = RequestSchema.safeParse(body);
+    if (!validation.success) {
+      return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
-    const tokenData = await getValidToken(sessionId, supabase);
+    const { action, params } = validation.data;
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+    const tokenData = await getValidToken(user.id, supabase);
     if (!tokenData) {
       return new Response(JSON.stringify({ 
         error: "Gmail not connected or token expired",
@@ -107,7 +177,10 @@ serve(async (req) => {
       });
 
       if (!response.ok) {
-        throw new Error(`Gmail API error: ${response.status}`);
+        return new Response(JSON.stringify({ error: "Failed to fetch emails" }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
 
       const data = await response.json();
@@ -148,12 +221,15 @@ serve(async (req) => {
       const { messageId } = params;
       
       const response = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}?format=full`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
       if (!response.ok) {
-        throw new Error(`Gmail API error: ${response.status}`);
+        return new Response(JSON.stringify({ error: "Failed to read email" }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
 
       const msg = await response.json();
@@ -185,14 +261,7 @@ serve(async (req) => {
 
     // Send email
     if (action === 'send') {
-      const { to, subject, body } = params;
-      
-      if (!to || !subject || !body) {
-        return new Response(JSON.stringify({ error: "Missing required fields: to, subject, body" }), {
-          status: 400,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      const { to, subject, body: emailBody } = params;
 
       // Create the email in RFC 2822 format
       const emailLines = [
@@ -200,7 +269,7 @@ serve(async (req) => {
         `Subject: ${subject}`,
         `Content-Type: text/plain; charset="UTF-8"`,
         '',
-        body
+        emailBody
       ];
       const emailContent = emailLines.join('\r\n');
       
@@ -223,13 +292,15 @@ serve(async (req) => {
       );
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error("Gmail send error:", errorText);
-        throw new Error(`Failed to send email: ${response.status}`);
+        console.error("Gmail send failed");
+        return new Response(JSON.stringify({ error: "Failed to send email" }), {
+          status: 502,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
       }
 
       const result = await response.json();
-      console.log("Email sent successfully:", result.id);
+      console.log("Email sent successfully");
 
       return new Response(JSON.stringify({
         success: true,
@@ -246,7 +317,7 @@ serve(async (req) => {
     });
   } catch (error) {
     console.error("Gmail API error:", error);
-    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), {
+    return new Response(JSON.stringify({ error: "An error occurred" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
