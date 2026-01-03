@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -20,81 +19,8 @@ function getCorsHeaders(req: Request) {
   };
 }
 
-// Rate limiting: in-memory store (per-isolate, resets on cold start)
-const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 30; // 30 requests per minute for Gmail API
-
-function checkRateLimit(userId: string): boolean {
-  const now = Date.now();
-  const entry = rateLimitStore.get(userId);
-  
-  if (!entry || now > entry.resetAt) {
-    rateLimitStore.set(userId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
-    return true;
-  }
-  
-  if (entry.count >= RATE_LIMIT_MAX) {
-    return false;
-  }
-  
-  entry.count++;
-  return true;
-}
-
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
-const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-
-// Input validation schemas
-const ListEmailsSchema = z.object({
-  action: z.literal('list'),
-  params: z.object({
-    query: z.string().max(500).optional(),
-    maxResults: z.number().int().min(1).max(50).optional(),
-  }).optional(),
-});
-
-const ReadEmailSchema = z.object({
-  action: z.literal('read'),
-  params: z.object({
-    messageId: z.string().min(1).max(100),
-  }),
-});
-
-const SendEmailSchema = z.object({
-  action: z.literal('send'),
-  params: z.object({
-    to: z.string().email().max(254),
-    subject: z.string().min(1).max(200),
-    body: z.string().min(1).max(50000),
-  }),
-});
-
-const RequestSchema = z.discriminatedUnion('action', [
-  ListEmailsSchema,
-  ReadEmailSchema,
-  SendEmailSchema,
-]);
-
-// Authenticate user from request
-async function getAuthenticatedUser(req: Request) {
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader?.startsWith('Bearer ')) {
-    return null;
-  }
-
-  const token = authHeader.replace('Bearer ', '');
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) {
-    return null;
-  }
-
-  return user;
-}
 
 async function refreshAccessToken(refreshToken: string): Promise<string | null> {
   const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -113,11 +39,11 @@ async function refreshAccessToken(refreshToken: string): Promise<string | null> 
   return data.access_token;
 }
 
-async function getValidToken(userId: string, supabase: any): Promise<{ token: string; email: string } | null> {
+async function getValidToken(sessionId: string, supabase: any): Promise<{ token: string; email: string } | null> {
   const { data } = await supabase
     .from('google_tokens')
     .select('*')
-    .eq('user_id', userId)
+    .eq('session_id', sessionId)
     .eq('service', 'gmail')
     .single();
 
@@ -132,7 +58,7 @@ async function getValidToken(userId: string, supabase: any): Promise<{ token: st
       await supabase.from('google_tokens').update({
         access_token: newToken,
         expires_at: expiresAt.toISOString(),
-      }).eq('user_id', userId).eq('service', 'gmail');
+      }).eq('session_id', sessionId).eq('service', 'gmail');
       return { token: newToken, email: data.email };
     }
     return null;
@@ -149,39 +75,13 @@ serve(async (req) => {
   }
 
   try {
-    // Validate authentication
-    const user = await getAuthenticatedUser(req);
-    if (!user) {
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    const { sessionId, action, params } = await req.json();
 
-    // Check rate limit
-    if (!checkRateLimit(user.id)) {
-      return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }), {
-        status: 429,
-        headers: { ...corsHeaders, "Content-Type": "application/json", "Retry-After": "60" },
-      });
-    }
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const body = await req.json();
-    
-    // Validate input
-    const validation = RequestSchema.safeParse(body);
-    if (!validation.success) {
-      return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-
-    const { action, params } = validation.data;
-
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-    const tokenData = await getValidToken(user.id, supabase);
+    const tokenData = await getValidToken(sessionId, supabase);
     if (!tokenData) {
       return new Response(JSON.stringify({ 
         error: "Gmail not connected or token expired",
@@ -207,10 +107,7 @@ serve(async (req) => {
       });
 
       if (!response.ok) {
-        return new Response(JSON.stringify({ error: "Failed to fetch emails" }), {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        throw new Error(`Gmail API error: ${response.status}`);
       }
 
       const data = await response.json();
@@ -251,15 +148,12 @@ serve(async (req) => {
       const { messageId } = params;
       
       const response = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}?format=full`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
       if (!response.ok) {
-        return new Response(JSON.stringify({ error: "Failed to read email" }), {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        throw new Error(`Gmail API error: ${response.status}`);
       }
 
       const msg = await response.json();
@@ -291,7 +185,14 @@ serve(async (req) => {
 
     // Send email
     if (action === 'send') {
-      const { to, subject, body: emailBody } = params;
+      const { to, subject, body } = params;
+      
+      if (!to || !subject || !body) {
+        return new Response(JSON.stringify({ error: "Missing required fields: to, subject, body" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
       // Create the email in RFC 2822 format
       const emailLines = [
@@ -299,7 +200,7 @@ serve(async (req) => {
         `Subject: ${subject}`,
         `Content-Type: text/plain; charset="UTF-8"`,
         '',
-        emailBody
+        body
       ];
       const emailContent = emailLines.join('\r\n');
       
@@ -322,15 +223,13 @@ serve(async (req) => {
       );
 
       if (!response.ok) {
-        console.error("Gmail send failed");
-        return new Response(JSON.stringify({ error: "Failed to send email" }), {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
+        const errorText = await response.text();
+        console.error("Gmail send error:", errorText);
+        throw new Error(`Failed to send email: ${response.status}`);
       }
 
       const result = await response.json();
-      console.log("Email sent successfully");
+      console.log("Email sent successfully:", result.id);
 
       return new Response(JSON.stringify({
         success: true,
@@ -347,7 +246,7 @@ serve(async (req) => {
     });
   } catch (error) {
     console.error("Gmail API error:", error);
-    return new Response(JSON.stringify({ error: "An error occurred" }), {
+    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

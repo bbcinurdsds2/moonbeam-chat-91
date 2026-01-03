@@ -24,8 +24,9 @@ export type Database = {
           refresh_token: string | null
           scopes: string[] | null
           service: string
+          session_id: string
           updated_at: string
-          user_id: string
+          user_id: string | null
         }
         Insert: {
           access_token: string
@@ -36,8 +37,9 @@ export type Database = {
           refresh_token?: string | null
           scopes?: string[] | null
           service?: string
+          session_id: string
           updated_at?: string
-          user_id: string
+          user_id?: string | null
         }
         Update: {
           access_token?: string
@@ -48,8 +50,9 @@ export type Database = {
           refresh_token?: string | null
           scopes?: string[] | null
           service?: string
+          session_id?: string
           updated_at?: string
-          user_id?: string
+          user_id?: string | null
         }
         Relationships: []
       }

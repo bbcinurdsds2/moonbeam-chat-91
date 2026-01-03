@@ -1,7 +1,6 @@
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
 
 // Allowed origins for CORS
 const ALLOWED_ORIGINS = [
@@ -21,42 +20,10 @@ function getCorsHeaders(req: Request) {
   };
 }
 
-// Rate limiting: in-memory store (per-isolate, resets on cold start)
-const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 20; // 20 requests per minute for chat (expensive AI calls)
-
-function checkRateLimit(userId: string): boolean {
-  const now = Date.now();
-  const entry = rateLimitStore.get(userId);
-  
-  if (!entry || now > entry.resetAt) {
-    rateLimitStore.set(userId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
-    return true;
-  }
-  
-  if (entry.count >= RATE_LIMIT_MAX) {
-    return false;
-  }
-  
-  entry.count++;
-  return true;
-}
-
 const GOOGLE_CLIENT_ID = Deno.env.get('GOOGLE_CLIENT_ID');
 const GOOGLE_CLIENT_SECRET = Deno.env.get('GOOGLE_CLIENT_SECRET');
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-
-// Input validation schema for chat messages
-const MessageSchema = z.object({
-  role: z.enum(['user', 'assistant', 'system']),
-  content: z.string().min(1).max(50000),
-});
-
-const ChatRequestSchema = z.object({
-  messages: z.array(MessageSchema).min(1).max(100),
-});
 
 // Authenticate user from request
 async function getAuthenticatedUser(req: Request) {
@@ -647,36 +614,14 @@ serve(async (req) => {
       });
     }
 
-    // Check rate limit
-    if (!checkRateLimit(user.id)) {
-      return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }), {
-        status: 429,
-        headers: { ...corsHeaders, "Content-Type": "application/json", "Retry-After": "60" },
-      });
-    }
-
-    const body = await req.json();
-    
-    // Validate input
-    const validation = ChatRequestSchema.safeParse(body);
-    if (!validation.success) {
-      return new Response(JSON.stringify({ error: 'Invalid request parameters' }), {
-        status: 400,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
-    
-    const { messages } = validation.data;
+    const { messages } = await req.json();
     const GROQ_API_KEY = Deno.env.get('GROQ_API_KEY');
     
     if (!GROQ_API_KEY) {
-      return new Response(JSON.stringify({ error: "AI service not configured" }), {
-        status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      throw new Error("GROQ_API_KEY is not configured");
     }
 
-    console.log("Chat request for user with", messages.length, "messages");
+    console.log("Starting chat request for user:", user.id, "with", messages.length, "messages");
 
     let emailContext = "";
     let calendarContext = "";
@@ -867,7 +812,7 @@ ${emailContext}${calendarContext}${actionResult}`;
     });
   } catch (error) {
     console.error("Chat function error:", error);
-    return new Response(JSON.stringify({ error: "An error occurred" }), {
+    return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
